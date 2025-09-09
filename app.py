@@ -2,21 +2,49 @@ import os
 import json
 import time
 import pandas as pd
-import streamlit as st
 import requests
+import streamlit as st
 
-# --------------------------------
+# ----------------------------
 # Config
-# --------------------------------
-API_BASE_URL = st.secrets.get("API_BASE_URL", os.environ.get("API_BASE_URL", "http://localhost:4000"))
+# ----------------------------
+API_BASE_URL = st.secrets.get("API_BASE_URL", os.environ.get("API_BASE_URL", "https://medchain-mock-api.onrender.com"))
 
 st.set_page_config(page_title="MedChain Admin", page_icon="🩺", layout="wide")
-st.title("MedChain – Records Admin")
 
-# --------------------------------
-# HTTP helpers
-# --------------------------------
-def api_health():
+# ----------------------------
+# Light styling (clean & modern)
+# ----------------------------
+st.markdown("""
+<style>
+/* Hide Streamlit default chrome */
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+/* Page padding & font */
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+
+/* Card */
+.card {
+  background: #ffffff;
+  border: 1px solid #eee;
+  border-radius: 16px;
+  padding: 16px 18px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.04);
+}
+
+/* Metric number */
+.kpi-number {font-size: 28px; font-weight: 700; line-height: 1;}
+
+/* Buttons row spacing */
+.btn-row .stButton > button {width: 100%;}
+</style>
+""", unsafe_allow_html=True)
+
+# ----------------------------
+# API helpers
+# ----------------------------
+def api_ok():
     try:
         r = requests.get(f"{API_BASE_URL}/health", timeout=8)
         r.raise_for_status()
@@ -24,166 +52,188 @@ def api_health():
     except Exception as e:
         return False, {"error": str(e)}
 
-def api_get_records():
-    try:
-        r = requests.get(f"{API_BASE_URL}/records", timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            data = []
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.error(f"Failed to fetch records: {e}")
-        return pd.DataFrame(columns=["id","name","note","createdAt"])
+def api_list():
+    r = requests.get(f"{API_BASE_URL}/records", timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return pd.DataFrame(data if isinstance(data, list) else [])
 
-def api_add_record(payload: dict):
-    r = requests.post(f"{API_BASE_URL}/records", json=payload, timeout=15)
+def api_create(obj: dict):
+    r = requests.post(f"{API_BASE_URL}/records", json=obj, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def api_update_record(rec_id: str, payload: dict):
-    r = requests.put(f"{API_BASE_URL}/records/{rec_id}", json=payload, timeout=15)
+def api_update(rec_id: str, obj: dict):
+    r = requests.put(f"{API_BASE_URL}/records/{rec_id}", json=obj, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def api_delete_record(rec_id: str):
+def api_delete(rec_id: str):
     r = requests.delete(f"{API_BASE_URL}/records/{rec_id}", timeout=15)
     r.raise_for_status()
-    return {"ok": True}
+    return True
 
-# --------------------------------
-# Header / status
-# --------------------------------
-c1, c2 = st.columns([2,1])
+# ----------------------------
+# Header
+# ----------------------------
+colA, colB = st.columns([3,1])
+with colA:
+    st.markdown("<h2 style='margin:0'>MedChain Admin</h2>", unsafe_allow_html=True)
+    st.caption(API_BASE_URL)
+
+with colB:
+    ok, _ = api_ok()
+    if ok:
+        st.success("API online", icon="✅")
+    else:
+        st.error("API unreachable", icon="⚠️")
+
+# ----------------------------
+# KPIs
+# ----------------------------
+def load_df():
+    try:
+        df = api_list()
+        if "createdAt" in df.columns:
+            df["createdAt"] = pd.to_datetime(df["createdAt"], unit="ms", errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"Failed to load records: {e}")
+        return pd.DataFrame()
+
+if "refresh_key" not in st.session_state:
+    st.session_state.refresh_key = time.time()
+
+df = load_df()
+
+c1, c2, c3 = st.columns(3)
 with c1:
-    st.caption(f"Backend URL: `{API_BASE_URL}`")
+    st.markdown('<div class="card"><div>Total Records</div><div class="kpi-number">{}</div></div>'.format(len(df)), unsafe_allow_html=True)
 with c2:
-    ok, info = api_health()
-    st.success("API: Online") if ok else st.error("API: Unreachable")
+    today = pd.Timestamp.now().normalize()
+    new_today = 0
+    if not df.empty and "createdAt" in df.columns:
+        new_today = df["createdAt"].dt.normalize().eq(today).sum()
+    st.markdown('<div class="card"><div>New Today</div><div class="kpi-number">{}</div></div>'.format(int(new_today)), unsafe_allow_html=True)
+with c3:
+    st.markdown('<div class="card"><div>Status</div><div class="kpi-number">Healthy</div></div>', unsafe_allow_html=True)
 
-tabs = st.tabs(["📥 Upload CSV", "➕ Add Record", "✏️ Edit / Delete"])
+st.write("")
 
-# --------------------------------
-# TAB 1: Upload CSV → bulk create
-# --------------------------------
-with tabs[0]:
-    st.subheader("Upload CSV")
-    st.caption("CSV headers should include at least: name, note (others allowed; id/createdAt ignored).")
-    up = st.file_uploader("Select CSV", type=["csv"])
+# ----------------------------
+# Tabs
+# ----------------------------
+t1, t2, t3 = st.tabs(["➕ Add", "✏️ Edit / Delete", "📥 Upload CSV"])
 
-    if up is not None:
-        try:
-            df = pd.read_csv(up)
-            if "name" not in df.columns:
-                st.warning("CSV must contain a 'name' column.")
-            st.write("Preview:")
-            st.dataframe(df, use_container_width=True)
-            if st.button("Create records from this CSV"):
-                created = 0
-                for _, row in df.iterrows():
-                    row_dict = row.drop(labels=[c for c in ["id","createdAt"] if c in row.index]).to_dict()
-                    # name is required by your API
-                    if not isinstance(row_dict.get("name"), str) or not row_dict.get("name"):
-                        continue
-                    # coerce NaNs to empty strings
-                    row_dict = {k: ("" if pd.isna(v) else v) for k, v in row_dict.items()}
-                    api_add_record(row_dict)
-                    created += 1
-                st.success(f"Created {created} records.")
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
-
-# --------------------------------
-# TAB 2: Add one record
-# --------------------------------
-with tabs[1]:
-    st.subheader("Add New Record")
-    with st.form("add_form", clear_on_submit=True):
-        name = st.text_input("Name *")
+# --------- TAB 1: Add ----------
+with t1:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        # Keep fields super simple; no JSON parsing required.
+        name = st.text_input("Name")
         note = st.text_area("Note")
-        extra_json = st.text_area("Extra fields (JSON, optional)", placeholder='{"age": 30, "city": "Vellore"}')
-        submitted = st.form_submit_button("Add Record")
-        if submitted:
-            if not name.strip():
-                st.error("Name is required.")
-                st.stop()
-            payload = {"name": name.strip(), "note": note or ""}
-            if extra_json.strip():
-                try:
-                    payload.update(json.loads(extra_json))
-                except Exception as e:
-                    st.error(f"Invalid JSON in extra fields: {e}")
-                    st.stop()
-            try:
-                api_add_record(payload)
-                st.success("Record added.")
-            except Exception as e:
-                st.error(f"Failed to add record: {e}")
+    with col2:
+        # Optional extra fields as free text key/value pairs
+        st.caption("Additional fields (optional)")
+        key1 = st.text_input("Field 1 key", placeholder="age")
+        val1 = st.text_input("Field 1 value", placeholder="32")
+        key2 = st.text_input("Field 2 key", placeholder="city")
+        val2 = st.text_input("Field 2 value", placeholder="Vellore")
+    add_clicked = st.button("Add Record", type="primary")
+    if add_clicked:
+        payload = {}
+        # Only include fields that have values
+        if name.strip(): payload["name"] = name.strip()
+        if note.strip(): payload["note"] = note.strip()
+        if key1.strip(): payload[key1.strip()] = val1
+        if key2.strip(): payload[key2.strip()] = val2
+        try:
+            api_create(payload if payload else {})
+            st.success("Record added.")
+        except Exception as e:
+            st.error(f"Failed to add: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# --------------------------------
-# TAB 3: Edit / Delete
-# --------------------------------
-with tabs[2]:
-    st.subheader("Records")
-    if "refresh_key" not in st.session_state:
-        st.session_state.refresh_key = 0
-
-    if st.button("Refresh"):
-        st.session_state.refresh_key = time.time()
-
-    df = api_get_records()
+# --------- TAB 2: Edit / Delete ----------
+with t2:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.caption("Tip: edit cells directly; tick rows to delete, then press buttons below.")
     if df.empty:
         st.info("No records yet.")
     else:
-        # normalize
-        if "id" not in df.columns:
-            st.warning("Backend is not returning 'id'; editing/deleting requires it.")
-        # nicer columns
-        show_df = df.copy()
-        if "createdAt" in show_df.columns:
-            show_df["createdAt"] = pd.to_datetime(show_df["createdAt"], unit="ms", errors="coerce")
-        st.dataframe(show_df, use_container_width=True, height=420)
+        # Add a delete checkbox column for selection
+        if "_delete" not in df.columns:
+            df["_delete"] = False
 
-        if "id" in df.columns:
-            st.markdown("### Edit or Delete a Record")
-            rec_id = st.selectbox("Choose record ID", ["-- select --"] + df["id"].astype(str).tolist())
-            if rec_id != "-- select --":
-                current = df[df["id"].astype(str) == rec_id].iloc[0].to_dict()
-                editable_cols = [c for c in df.columns if c not in ["id","createdAt"]]
+        # Make id/createdAt not editable
+        disabled_cols = []
+        if "id" in df.columns: disabled_cols.append("id")
+        if "createdAt" in df.columns: disabled_cols.append("createdAt")
 
-                with st.form("edit_form"):
-                    editors = {}
-                    for c in editable_cols:
-                        v = current.get(c, "")
-                        if isinstance(v, (dict, list)):
-                            editors[c] = st.text_area(f"{c} (JSON)", value=json.dumps(v, ensure_ascii=False))
-                        else:
-                            editors[c] = st.text_input(c, value=str(v) if v is not None else "")
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            height=450,
+            disabled=disabled_cols,
+            num_rows="dynamic",
+            key="editor",
+        )
 
-                    col1, col2 = st.columns(2)
-                    update_btn = col1.form_submit_button("Update")
-                    delete_btn = col2.form_submit_button("Delete", type="primary")
+        colx, coly, colz = st.columns([1,1,6], gap="small")
+        with colx:
+            if st.button("Save edits", type="primary"):
+                try:
+                    # Find rows whose non-id fields changed
+                    orig = df.set_index("id") if "id" in df.columns else df
+                    new = edited_df.set_index("id") if "id" in edited_df.columns else edited_df
+                    common_ids = list(set(orig.index).intersection(set(new.index)))
+                    updates = 0
+                    for rid in common_ids:
+                        before = orig.loc[rid].to_dict()
+                        after = new.loc[rid].to_dict()
+                        if before != after:
+                            # remove helper column and immutable fields
+                            after.pop("_delete", None)
+                            after.pop("createdAt", None)
+                            api_update(str(rid), after)
+                            updates += 1
+                    st.success(f"Saved {updates} update(s).")
+                except Exception as e:
+                    st.error(f"Update failed: {e}")
 
-                if update_btn:
-                    payload = {}
-                    for c, v in editors.items():
-                        vs = (v or "").strip()
-                        if (vs.startswith("{") and vs.endswith("}")) or (vs.startswith("[") and vs.endswith("]")):
-                            try:
-                                payload[c] = json.loads(vs)
-                            except Exception:
-                                payload[c] = v
-                        else:
-                            payload[c] = v
+        with coly:
+            if st.button("Delete selected", type="secondary"):
+                try:
+                    to_del = edited_df[edited_df.get("_delete", False) == True]
+                    cnt = 0
+                    for rid in to_del.get("id", []):
+                        api_delete(str(rid))
+                        cnt += 1
+                    st.success(f"Deleted {cnt} record(s).")
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# --------- TAB 3: Upload CSV ----------
+with t3:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    up = st.file_uploader("Choose CSV", type=["csv"])
+    if up is not None:
+        try:
+            csv_df = pd.read_csv(up)
+            st.dataframe(csv_df, use_container_width=True, height=400)
+            if st.button("Create records from CSV"):
+                created = 0
+                for _, row in csv_df.iterrows():
+                    d = {k: ("" if pd.isna(v) else v) for k, v in row.to_dict().items()}
                     try:
-                        api_update_record(rec_id, payload)
-                        st.success("Record updated.")
-                    except Exception as e:
-                        st.error(f"Update failed: {e}")
-
-                if delete_btn:
-                    try:
-                        api_delete_record(rec_id)
-                        st.success("Record deleted.")
-                    except Exception as e:
-                        st.error(f"Delete failed: {e}")
+                        api_create(d)
+                        created += 1
+                    except Exception:
+                        pass
+                st.success(f"Created {created} record(s).")
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
